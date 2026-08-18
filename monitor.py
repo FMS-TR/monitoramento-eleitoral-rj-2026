@@ -1,27 +1,28 @@
 import os
 import csv
 import io
-import json
-import hashlib
-import requests
 import zipfile
+import requests
+from pathlib import Path
 
 UF = "RJ"
-
-CARGOS = {
-    "Governador",
-    "Senador",
-    "Deputado Federal",
-    "Deputado Estadual",
-    "Deputado Distrital",
-}
-
-CKAN_API = "https://dadosabertos.tse.jus.br/api/3/action/package_show"
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-STATE_FILE = "estado_monitoramento.json"
+TSE_ZIP_URL = (
+    "https://cdn.tse.jus.br/estatistica/sead/odsele/consulta_cand/"
+    "consulta_cand_2026.zip"
+)
+
+CARGOS = {
+    "GOVERNADOR": "Governador",
+    "SENADOR": "Senador",
+    "DEPUTADO FEDERAL": "Deputado Federal",
+    "DEPUTADO ESTADUAL": "Deputado Estadual",
+}
+
+ESTADO = Path("estado.json")
 
 
 def telegram(mensagem):
@@ -39,514 +40,198 @@ def telegram(mensagem):
     resposta.raise_for_status()
 
 
-def obter_url_candidatos():
-    print("Consultando catálogo oficial do TSE...")
+def baixar_rj():
+    print("Baixando arquivo oficial do TSE...")
+    print(TSE_ZIP_URL)
 
-    resposta = requests.get(
-        CKAN_API,
-        params={"id": "candidatos-2026"},
-        timeout=30,
-    )
-
+    resposta = requests.get(TSE_ZIP_URL, timeout=120)
     resposta.raise_for_status()
 
-    dados = resposta.json()
+    print(f"Download concluído: {len(resposta.content)} bytes")
 
-    if not dados.get("success"):
-        raise RuntimeError(
-            "O catálogo do TSE não retornou sucesso."
-        )
-
-    recursos = dados["result"]["resources"]
-
-    for recurso in recursos:
-        nome = str(recurso.get("name", "")).lower()
-
-        if "candidato" in nome:
-            url = recurso.get("url")
-
-            if url:
-                print("Arquivo oficial encontrado:")
-                print(url)
-                return url
-
-    raise RuntimeError(
-        "Não foi encontrado o arquivo de candidatos 2026."
-    )
-
-
-def baixar_candidatos():
-    url = obter_url_candidatos()
-
-    print("Baixando dados oficiais do TSE...")
-
-    resposta = requests.get(
-        url,
-        timeout=180,
-    )
-
-    resposta.raise_for_status()
-
-    conteudo = resposta.content
-
-    print(
-        f"Download concluído: {len(conteudo)} bytes"
-    )
-
-    return conteudo
-
-
-def extrair_csv_do_zip(conteudo):
-    if not zipfile.is_zipfile(io.BytesIO(conteudo)):
-        return conteudo
-
-    print("Arquivo ZIP detectado.")
-
-    with zipfile.ZipFile(
-        io.BytesIO(conteudo)
-    ) as arquivo_zip:
-
-        nomes = arquivo_zip.namelist()
+    with zipfile.ZipFile(io.BytesIO(resposta.content)) as z:
+        arquivos = z.namelist()
 
         print("Arquivos encontrados no ZIP:")
+        for arquivo in arquivos:
+            print("-", arquivo)
 
-        for nome in nomes:
-            print("-", nome)
+        nome_rj = None
 
-        csvs = [
-            nome
-            for nome in nomes
-            if nome.lower().endswith(".csv")
-        ]
+        for arquivo in arquivos:
+            nome = arquivo.replace("\\", "/").split("/")[-1]
 
-        if not csvs:
+            if nome.lower() == "consulta_cand_2026_rj.csv":
+                nome_rj = arquivo
+                break
+
+        if not nome_rj:
             raise RuntimeError(
-                "O ZIP do TSE não contém arquivo CSV."
+                "ERRO: consulta_cand_2026_RJ.csv não foi encontrado no ZIP."
             )
 
-        # Preferir o arquivo principal de candidatos
-        principal = None
+        print(f"Arquivo RJ encontrado: {nome_rj}")
 
-        for nome in csvs:
-            nome_lower = nome.lower()
+        conteudo = z.read(nome_rj)
 
-            if "consulta_cand" in nome_lower:
-                principal = nome
-                break
-
-            if "candidato" in nome_lower:
-                principal = nome
-                break
-
-        if principal is None:
-            principal = csvs[0]
-
-        print(
-            f"Usando arquivo: {principal}"
-        )
-
-        return arquivo_zip.read(principal)
+        return conteudo
 
 
-def encontrar_coluna(cabecalho, nomes):
-    mapa = {}
+def ler_candidatos():
+    conteudo = baixar_rj()
 
-    for coluna in cabecalho:
-        limpa = (
-            str(coluna)
-            .replace("\ufeff", "")
-            .strip()
-            .upper()
-        )
+    # O TSE normalmente fornece arquivos em Latin-1/Windows-1252.
+    texto = None
 
-        mapa[limpa] = coluna
-
-    for nome in nomes:
-        nome_upper = nome.upper()
-
-        if nome_upper in mapa:
-            return mapa[nome_upper]
-
-    return None
-
-
-def ler_candidatos(conteudo):
-    conteudo = extrair_csv_do_zip(conteudo)
-
-    tentativas = [
-        ("latin1", ";"),
-        ("utf-8-sig", ";"),
-        ("latin1", ","),
-        ("utf-8-sig", ","),
-    ]
-
-    for encoding, delimitador in tentativas:
-
+    for encoding in ("latin1", "cp1252", "utf-8"):
         try:
-            texto = conteudo.decode(
-                encoding
-            )
-
-            leitor = csv.DictReader(
-                io.StringIO(texto),
-                delimiter=delimitador,
-            )
-
-            cabecalho = leitor.fieldnames or []
-
-            uf_col = encontrar_coluna(
-                cabecalho,
-                [
-                    "SG_UF",
-                    "SG_UF_CANDIDATO",
-                    "UF",
-                ],
-            )
-
-            cargo_col = encontrar_coluna(
-                cabecalho,
-                [
-                    "DS_CARGO",
-                    "CARGO",
-                ],
-            )
-
-            if uf_col and cargo_col:
-
-                print(
-                    f"Colunas encontradas: "
-                    f"{uf_col} / {cargo_col}"
-                )
-
-                candidatos = []
-
-                for linha in leitor:
-
-                    uf = str(
-                        linha.get(
-                            uf_col,
-                            "",
-                        )
-                    ).strip().upper()
-
-                    cargo = str(
-                        linha.get(
-                            cargo_col,
-                            "",
-                        )
-                    ).strip()
-
-                    if uf != UF:
-                        continue
-
-                    if cargo not in CARGOS:
-                        continue
-
-                    candidatos.append(linha)
-
-                return candidatos
-
+            texto = conteudo.decode(encoding)
+            print(f"Arquivo decodificado como: {encoding}")
+            break
         except UnicodeDecodeError:
             continue
 
-    raise RuntimeError(
-        "Não foi possível identificar as colunas "
-        "SG_UF e DS_CARGO no arquivo do TSE."
+    if texto is None:
+        raise RuntimeError("Não foi possível decodificar o CSV do TSE.")
+
+    primeira_linha = texto.splitlines()[0]
+
+    if ";" in primeira_linha:
+        delimitador = ";"
+    elif "," in primeira_linha:
+        delimitador = ","
+    else:
+        raise RuntimeError("Não foi possível identificar o delimitador do CSV.")
+
+    print(f"Delimitador identificado: {repr(delimitador)}")
+
+    leitor = csv.DictReader(
+        io.StringIO(texto),
+        delimiter=delimitador,
     )
 
+    if not leitor.fieldnames:
+        raise RuntimeError("O CSV não possui cabeçalho.")
 
-def preparar_registro(candidato):
+    print("Colunas encontradas:")
+    print(" / ".join(leitor.fieldnames))
 
-    campos = [
-        "SQ_CANDIDATO",
-        "NR_CANDIDATO",
-        "NM_CANDIDATO",
-        "NM_URNA_CANDIDATO",
-        "DS_CARGO",
-        "SG_PARTIDO",
-        "NM_PARTIDO",
-        "DS_SITUACAO_CANDIDATURA",
-        "DS_DETALHE_SITUACAO_CAND",
-    ]
+    candidatos = []
 
-    registro = {}
+    for linha in leitor:
+        uf = (linha.get("SG_UF") or "").strip().upper()
 
-    for campo in campos:
+        if uf and uf != UF:
+            continue
 
-        valor = candidato.get(campo)
+        cargo = (
+            linha.get("DS_CARGO")
+            or linha.get("NM_CARGO")
+            or ""
+        ).strip().upper()
 
-        if valor is not None:
+        if cargo in CARGOS:
+            candidatos.append(linha)
 
-            registro[campo] = str(
-                valor
-            ).strip()
-
-    if not registro:
-
-        registro = {
-            str(k): str(v)
-            for k, v in candidato.items()
-        }
-
-    return registro
+    return candidatos
 
 
-def gerar_hash(candidatos):
-
-    registros = [
-        preparar_registro(candidato)
-        for candidato in candidatos
-    ]
-
-    registros.sort(
-        key=lambda x: (
-            x.get(
-                "SQ_CANDIDATO",
-                "",
-            ),
-            x.get(
-                "NM_CANDIDATO",
-                "",
-            ),
-        )
-    )
-
-    texto = json.dumps(
-        registros,
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-
-    hash_atual = hashlib.sha256(
-        texto.encode("utf-8")
-    ).hexdigest()
-
-    return hash_atual, registros
+def nome_candidato(candidato):
+    return (
+        candidato.get("NM_CANDIDATO")
+        or candidato.get("nm_CANDIDATO")
+        or candidato.get("NM_URNA_CANDIDATO")
+        or "Nome não informado"
+    ).strip()
 
 
-def carregar_estado():
-
-    if not os.path.exists(
-        STATE_FILE
-    ):
-        return None
-
-    with open(
-        STATE_FILE,
-        "r",
-        encoding="utf-8",
-    ) as arquivo:
-
-        return json.load(arquivo)
+def situacao(candidato):
+    return (
+        candidato.get("DS_SITUACAO_CANDIDATURA")
+        or candidato.get("DS_SITUACAO")
+        or "Não informada"
+    ).strip()
 
 
-def salvar_estado(
-    hash_atual,
-    registros,
-):
-
-    estado = {
-        "hash": hash_atual,
-        "total": len(registros),
-        "candidatos": registros,
-    }
-
-    with open(
-        STATE_FILE,
-        "w",
-        encoding="utf-8",
-    ) as arquivo:
-
-        json.dump(
-            estado,
-            arquivo,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-
-def resumo(registros):
-
-    contagem = {}
-
-    for candidato in registros:
-
-        cargo = candidato.get(
-            "DS_CARGO",
-            "Cargo não informado",
-        )
-
-        contagem[cargo] = (
-            contagem.get(cargo, 0) + 1
-        )
-
-    linhas = []
-
-    for cargo in sorted(contagem):
-
-        linhas.append(
-            f"{cargo}: "
-            f"{contagem[cargo]}"
-        )
-
-    return "\n".join(linhas)
-
-
-def monitorar():
-
-    print("=" * 50)
+def main():
+    print("=" * 60)
     print("MONITORAMENTO ELEITORAL RJ 2026")
-    print("=" * 50)
+    print("=" * 60)
 
-    print(f"UF: {UF}")
-    print("Fonte: TSE - Candidatos 2026")
+    candidatos = ler_candidatos()
 
-    conteudo = baixar_candidatos()
-
-    candidatos = ler_candidatos(
-        conteudo
-    )
-
-    print(
-        "Candidatos RJ encontrados: "
-        f"{len(candidatos)}"
-    )
-
-    hash_atual, registros = (
-        gerar_hash(candidatos)
-    )
-
-    estado_anterior = carregar_estado()
-
-    if estado_anterior is None:
-
-        salvar_estado(
-            hash_atual,
-            registros,
-        )
-
-        mensagem = (
-            "🟢 MONITORAMENTO ELEITORAL "
-            "RJ 2026\n\n"
-            "Monitoramento iniciado "
-            "com sucesso.\n\n"
-            f"Candidatos monitorados: "
-            f"{len(registros)}\n\n"
-            f"{resumo(registros)}\n\n"
-            "Fonte: TSE - Candidatos 2026."
-        )
-
-        telegram(mensagem)
-
-        print(
-            "Primeira execução concluída."
-        )
-
-        return
-
-    if (
-        estado_anterior.get("hash")
-        == hash_atual
-    ):
-
-        print(
-            "Nenhuma alteração detectada."
-        )
-
-        return
-
-    anterior = estado_anterior.get(
-        "candidatos",
-        [],
-    )
-
-    antigos = {
-        x.get(
-            "SQ_CANDIDATO",
-            "",
-        ): x
-        for x in anterior
+    contagem = {
+        "Governador": 0,
+        "Senador": 0,
+        "Deputado Federal": 0,
+        "Deputado Estadual": 0,
     }
 
-    atuais = {
-        x.get(
-            "SQ_CANDIDATO",
-            "",
-        ): x
-        for x in registros
+    exemplos = {
+        "Governador": [],
+        "Senador": [],
+        "Deputado Federal": [],
+        "Deputado Estadual": [],
     }
 
-    adicionados = [
-        atuais[chave]
-        for chave in atuais
-        if chave not in antigos
-    ]
+    for candidato in candidatos:
+        cargo_original = (
+            candidato.get("DS_CARGO")
+            or candidato.get("NM_CARGO")
+            or ""
+        ).strip().upper()
 
-    removidos = [
-        antigos[chave]
-        for chave in antigos
-        if chave not in atuais
-    ]
+        cargo_nome = CARGOS.get(cargo_original)
+
+        if not cargo_nome:
+            continue
+
+        contagem[cargo_nome] += 1
+
+        if len(exemplos[cargo_nome]) < 3:
+            exemplos[cargo_nome].append(
+                nome_candidato(candidato)
+            )
+
+    total = sum(contagem.values())
+
+    print()
+    print("RESULTADO DO TESTE:")
+    print("Governador:", contagem["Governador"])
+    print("Senador:", contagem["Senador"])
+    print("Deputado Federal:", contagem["Deputado Federal"])
+    print("Deputado Estadual:", contagem["Deputado Estadual"])
+    print("TOTAL:", total)
 
     mensagem = (
-        "🚨 ALTERAÇÃO NO MONITORAMENTO "
-        "ELEITORAL RJ 2026\n\n"
-        f"Candidatos atuais: "
-        f"{len(registros)}\n\n"
+        "🧪 TESTE TSE — RJ 2026\n\n"
+        f"Governador: {contagem['Governador']}\n"
+        f"Senador: {contagem['Senador']}\n"
+        f"Deputado Federal: {contagem['Deputado Federal']}\n"
+        f"Deputado Estadual: {contagem['Deputado Estadual']}\n\n"
+        f"TOTAL: {total}\n\n"
+        "Fonte: TSE — Candidatos 2026."
     )
 
-    if adicionados:
+    if total > 0:
+        mensagem += "\n\nExemplos encontrados:\n"
 
-        mensagem += (
-            "🟢 NOVOS CANDIDATOS:\n"
-        )
-
-        for candidato in adicionados[:30]:
-
-            mensagem += (
-                f"- "
-                f"{candidato.get('NM_CANDIDATO', 'Nome não informado')} "
-                f"("
-                f"{candidato.get('DS_CARGO', '')}"
-                f")\n"
-            )
-
-        mensagem += "\n"
-
-    if removidos:
-
-        mensagem += (
-            "🔴 CANDIDATOS REMOVIDOS:\n"
-        )
-
-        for candidato in removidos[:30]:
-
-            mensagem += (
-                f"- "
-                f"{candidato.get('NM_CANDIDATO', 'Nome não informado')} "
-                f"("
-                f"{candidato.get('DS_CARGO', '')}"
-                f")\n"
-            )
-
-        mensagem += "\n"
-
-    mensagem += (
-        "Fonte: TSE - Candidatos 2026."
-    )
+        for cargo in exemplos:
+            if exemplos[cargo]:
+                mensagem += (
+                    f"\n{cargo}:\n"
+                    + "\n".join(
+                        f"• {nome}" for nome in exemplos[cargo]
+                    )
+                    + "\n"
+                )
 
     telegram(mensagem)
 
-    salvar_estado(
-        hash_atual,
-        registros,
-    )
-
-    print(
-        "Alteração detectada e enviada "
-        "pelo Telegram."
-    )
+    print()
+    print("Mensagem enviada para o Telegram.")
+    print("TESTE CONCLUÍDO.")
 
 
 if __name__ == "__main__":
-    monitorar()
+    main()
