@@ -2,11 +2,13 @@ import os
 import json
 import hashlib
 import requests
+import time
 from pathlib import Path
 
 TSE_BASE = "https://divulgacandcontas.tse.jus.br/divulga/rest/v1"
 
-ELEICAO = "20322002026"
+ANO = 2026
+ELEICAO = 20322002026
 UF = "RJ"
 
 CARGOS = {
@@ -37,48 +39,65 @@ def telegram(mensagem):
     r.raise_for_status()
 
 
-def buscar_candidatos(cargo):
-    url = f"{TSE_BASE}/candidatura/buscar/{ELEICAO}/{UF}/{cargo}"
+def obter_candidatos(cargo):
+    """
+    Consulta diretamente a candidatura do RJ.
+    Para eleições gerais, não usamos a antiga
+    consulta de municípios.
+    """
 
-    r = requests.get(url, timeout=60)
+    # Código da unidade eleitoral do RJ usado pelo TSE
+    municipios = [3304557]
 
-    if r.status_code != 200:
-        print("Erro TSE:", r.status_code, url)
-        return []
+    todos = []
 
-    try:
-        dados = r.json()
-    except Exception:
-        return []
+    for municipio in municipios:
 
-    if isinstance(dados, list):
-        return dados
+        url = (
+            f"{TSE_BASE}/candidatura/listar/"
+            f"{ANO}/{municipio}/{ELEICAO}/{cargo}/candidatos"
+        )
 
-    if isinstance(dados, dict):
-        for chave in ("candidatos", "content", "lista", "dados"):
-            if isinstance(dados.get(chave), list):
-                return dados[chave]
+        try:
+            r = requests.get(url, timeout=30)
 
-    return []
+            print(f"Consulta cargo {cargo}: HTTP {r.status_code}")
 
+            if r.status_code == 200:
+                dados = r.json()
 
-def resumo(candidato):
-    texto = json.dumps(
-        candidato,
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    return hashlib.sha256(texto.encode()).hexdigest()
+                if isinstance(dados, dict):
+                    candidatos = dados.get("candidatos", [])
+
+                elif isinstance(dados, list):
+                    candidatos = dados
+
+                else:
+                    candidatos = []
+
+                todos.extend(candidatos)
+
+            else:
+                print(f"Resposta TSE: {r.text[:300]}")
+
+        except Exception as e:
+            print(f"Erro na consulta: {e}")
+
+        time.sleep(1)
+
+    return todos
 
 
 def carregar_estado():
-    if not ESTADO.exists():
-        return {}
+    if ESTADO.exists():
+        try:
+            return json.loads(
+                ESTADO.read_text(encoding="utf-8")
+            )
+        except Exception:
+            pass
 
-    try:
-        return json.loads(ESTADO.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return {}
 
 
 def salvar_estado(estado):
@@ -86,84 +105,199 @@ def salvar_estado(estado):
         json.dumps(
             estado,
             ensure_ascii=False,
-            indent=2,
+            indent=2
         ),
         encoding="utf-8",
     )
 
 
-def nome_candidato(c):
-    return (
-        c.get("nomeUrna")
-        or c.get("nomeCompleto")
-        or c.get("nome")
-        or "Candidato"
+def identificador(candidato):
+    texto = json.dumps(
+        candidato,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
     )
+
+    return hashlib.sha256(
+        texto.encode("utf-8")
+    ).hexdigest()
+
+
+def nome_candidato(candidato):
+    return (
+        candidato.get("nm_CANDIDATO")
+        or candidato.get("nomeCompleto")
+        or candidato.get("nomeCandidato")
+        or candidato.get("nm_candidato")
+        or candidato.get("nome")
+        or "Nome não informado"
+    )
+
+
+def numero_candidato(candidato):
+    return (
+        candidato.get("nr_CANDIDATO")
+        or candidato.get("numero")
+        or ""
+    )
+
+
+def partido_candidato(candidato):
+    partido = candidato.get("partido")
+
+    if isinstance(partido, dict):
+        return (
+            partido.get("sigla")
+            or partido.get("nome")
+            or ""
+        )
+
+    return (
+        candidato.get("sg_PARTIDO")
+        or candidato.get("siglaPartido")
+        or ""
+    )
+
+
+def situacao_candidato(candidato):
+    return (
+        candidato.get("ds_SITUACAO_CANDIDATURA")
+        or candidato.get("descricaoSituacao")
+        or candidato.get("descricaoSituacaoCandidato")
+        or candidato.get("situacaoCandidato")
+        or candidato.get("stRegistro")
+        or "Não informada"
+    )
+
+
+def analisar_mudancas(
+    candidatos,
+    estado_anterior,
+    cargo_nome
+):
+    novas = []
+    alteradas = []
+
+    for candidato in candidatos:
+
+        chave_original = (
+            candidato.get("sq_CANDIDATO")
+            or candidato.get("idCandidato")
+            or candidato.get("id")
+            or candidato.get("nr_CANDIDATO")
+            or candidato.get("numero")
+        )
+
+        if chave_original is None:
+            chave_original = nome_candidato(candidato)
+
+        chave = f"{cargo_nome}:{chave_original}"
+
+        atual = identificador(candidato)
+
+        if chave not in estado_anterior:
+            novas.append(
+                (chave, candidato, atual)
+            )
+
+        elif estado_anterior[chave] != atual:
+            alteradas.append(
+                (chave, candidato, atual)
+            )
+
+    return novas, alteradas
 
 
 def main():
 
-    print("INICIANDO MONITORAMENTO TSE...")
-    print("Eleição:", ELEICAO)
-    print("UF:", UF)
+    print("===================================")
+    print("MONITORAMENTO ELEITORAL RJ 2026")
+    print("===================================")
+    print(f"Eleição: {ELEICAO}")
+    print(f"UF: {UF}")
 
     estado_anterior = carregar_estado()
-    estado_novo = {}
 
-    total = 0
-    alteracoes = []
+    estado_novo = dict(estado_anterior)
 
-    for cargo, nome_cargo in CARGOS.items():
+    total_novos = 0
+    total_alterados = 0
+    total_candidatos = 0
 
-        print(f"Consultando {nome_cargo}...")
+    for cargo, cargo_nome in CARGOS.items():
 
-        candidatos = buscar_candidatos(cargo)
+        print("")
+        print(f"Consultando {cargo_nome}...")
 
-        print("Encontrados:", len(candidatos))
+        candidatos = obter_candidatos(cargo)
 
-        for candidato in candidatos:
+        print(
+            f"Candidatos encontrados: "
+            f"{len(candidatos)}"
+        )
 
-            chave = (
-                str(
-                    candidato.get("id")
-                    or candidato.get("sequencial")
-                    or candidato.get("numero")
-                    or resumo(candidato)
-                )
+        total_candidatos += len(candidatos)
+
+        novas, alteradas = analisar_mudancas(
+            candidatos,
+            estado_anterior,
+            cargo_nome,
+        )
+
+        for chave, candidato, assinatura in novas:
+
+            mensagem = (
+                "🗳️ NOVA CANDIDATURA — RJ 2026\n\n"
+                f"Cargo: {cargo_nome}\n"
+                f"Candidato: {nome_candidato(candidato)}\n"
+                f"Número: {numero_candidato(candidato)}\n"
+                f"Partido: {partido_candidato(candidato)}\n"
+                f"Situação: {situacao_candidato(candidato)}"
             )
 
-            assinatura = resumo(candidato)
+            try:
+                telegram(mensagem)
+                print("Telegram enviado.")
+            except Exception as e:
+                print(
+                    f"Erro ao enviar Telegram: {e}"
+                )
 
             estado_novo[chave] = assinatura
-            total += 1
+            total_novos += 1
 
-            anterior = estado_anterior.get(chave)
+        for chave, candidato, assinatura in alteradas:
 
-            if anterior is not None and anterior != assinatura:
+            mensagem = (
+                "⚠️ ALTERAÇÃO EM CANDIDATURA — RJ 2026\n\n"
+                f"Cargo: {cargo_nome}\n"
+                f"Candidato: {nome_candidato(candidato)}\n"
+                f"Número: {numero_candidato(candidato)}\n"
+                f"Partido: {partido_candidato(candidato)}\n"
+                f"Situação: {situacao_candidato(candidato)}"
+            )
 
-                alteracoes.append(
-                    f"⚠️ ALTERAÇÃO DETECTADA\n"
-                    f"Cargo: {nome_cargo}\n"
-                    f"Candidato: {nome_candidato(candidato)}"
+            try:
+                telegram(mensagem)
+                print("Telegram enviado.")
+            except Exception as e:
+                print(
+                    f"Erro ao enviar Telegram: {e}"
                 )
+
+            estado_novo[chave] = assinatura
+            total_alterados += 1
 
     salvar_estado(estado_novo)
 
-    print("Total de candidatos:", total)
-    print("Alterações:", len(alteracoes))
-
-    if alteracoes:
-
-        mensagem = (
-            "🗳️ MONITORAMENTO ELEITORAL RJ 2026\n\n"
-            + "\n\n".join(alteracoes)
-        )
-
-        telegram(mensagem)
-
-    else:
-
-        print("Nenhuma alteração detectada.")
+    print("")
+    print("===================================")
+    print("MONITORAMENTO CONCLUÍDO")
+    print(f"Total de candidatos: {total_candidatos}")
+    print(f"Novas candidaturas: {total_novos}")
+    print(f"Alterações: {total_alterados}")
+    print("===================================")
 
 
 if __name__ == "__main__":
