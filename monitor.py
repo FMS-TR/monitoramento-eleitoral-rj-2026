@@ -7,7 +7,7 @@ from pathlib import Path
 TSE_BASE = "https://divulgacandcontas.tse.jus.br/divulga/rest/v1"
 
 ANO = 2026
-ELEICAO = 2030602026
+ELEICAO = 20322002026
 UF = "RJ"
 
 CARGOS = {
