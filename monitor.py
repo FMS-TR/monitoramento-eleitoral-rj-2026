@@ -2,40 +2,34 @@ import os
 import csv
 import io
 import json
-import zipfile
 import hashlib
 import requests
-from pathlib import Path
 
-ANO = 2026
 UF = "RJ"
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-
-ESTADO = Path("estado.json")
-
-URL_CANDIDATOS = (
-    "https://cdn.tse.jus.br/estatistica/sead/odsele/"
-    "consulta_cand/2026/consulta_cand_2026.zip"
-)
-
 CARGOS = {
-    "GOVERNADOR": "Governador",
-    "SENADOR": "Senador",
-    "DEPUTADO FEDERAL": "Deputado Federal",
-    "DEPUTADO ESTADUAL": "Deputado Estadual",
+    "Governador",
+    "Senador",
+    "Deputado Federal",
+    "Deputado Estadual",
+    "Deputado Distrital",
 }
 
+CKAN_API = "https://dadosabertos.tse.jus.br/api/3/action/package_show"
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-def telegram(texto):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+STATE_FILE = "estado_monitoramento.json"
+
+
+def telegram(mensagem):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     resposta = requests.post(
         url,
         json={
             "chat_id": CHAT_ID,
-            "text": texto,
+            "text": mensagem,
         },
         timeout=30,
     )
@@ -43,74 +37,112 @@ def telegram(texto):
     resposta.raise_for_status()
 
 
+def obter_url_candidatos():
+    print("Consultando catálogo oficial do TSE...")
+
+    resposta = requests.get(
+        CKAN_API,
+        params={"id": "candidatos-2026"},
+        timeout=30,
+    )
+
+    resposta.raise_for_status()
+
+    dados = resposta.json()
+
+    if not dados.get("success"):
+        raise RuntimeError("O catálogo do TSE não retornou sucesso.")
+
+    recursos = dados["result"]["resources"]
+
+    for recurso in recursos:
+        nome = str(recurso.get("name", "")).lower()
+        formato = str(recurso.get("format", "")).lower()
+
+        if "candidato" in nome and formato == "csv":
+            print("Arquivo oficial encontrado:")
+            print(recurso["url"])
+            return recurso["url"]
+
+    raise RuntimeError("Não foi encontrado o CSV oficial de candidatos 2026.")
+
+
 def baixar_candidatos():
+    url = obter_url_candidatos()
+
     print("Baixando dados oficiais do TSE...")
 
     resposta = requests.get(
-        URL_CANDIDATOS,
+        url,
         timeout=120,
     )
 
     resposta.raise_for_status()
 
-    print(
-        f"Arquivo recebido: "
-        f"{len(resposta.content) / 1024 / 1024:.1f} MB"
-    )
+    print("Download concluído.")
 
-    arquivo_zip = zipfile.ZipFile(
-        io.BytesIO(resposta.content)
-    )
+    return resposta.content
 
-    arquivos = arquivo_zip.namelist()
 
-    arquivo_rj = None
+def encontrar_coluna(cabecalho, nomes):
+    mapa = {c.strip().upper(): c for c in cabecalho}
 
-    for nome in arquivos:
-        nome_maiusculo = nome.upper()
+    for nome in nomes:
+        if nome.upper() in mapa:
+            return mapa[nome.upper()]
 
-        if (
-            "CONSULTA_CAND_2026_RJ" in nome_maiusculo
-            and nome_maiusculo.endswith(".CSV")
-        ):
-            arquivo_rj = nome
-            break
+    return None
 
-    if arquivo_rj is None:
-        raise RuntimeError(
-            "Arquivo de candidatos do RJ não encontrado no ZIP."
+
+def ler_candidatos(conteudo):
+    texto = conteudo.decode("latin1")
+
+    amostra = texto[:10000]
+
+    try:
+        dialect = csv.Sniffer().sniff(
+            amostra,
+            delimiters=";,|\t",
         )
-
-    print(f"Lendo: {arquivo_rj}")
-
-    dados = arquivo_zip.read(arquivo_rj)
-
-    return dados
-
-
-def ler_candidatos(dados):
-    candidatos = []
-
-    texto = dados.decode(
-        "latin-1",
-        errors="replace"
-    )
+    except csv.Error:
+        dialect = csv.excel
+        dialect.delimiter = ";"
 
     leitor = csv.DictReader(
         io.StringIO(texto),
-        delimiter=";"
+        dialect=dialect,
     )
 
-    for linha in leitor:
+    cabecalho = leitor.fieldnames or []
 
-        if linha.get("SG_UF", "").strip().upper() != UF:
-            continue
+    uf_col = encontrar_coluna(
+        cabecalho,
+        ["SG_UF"],
+    )
 
-        cargo = (
-            linha.get("DS_CARGO", "")
-            .strip()
-            .upper()
+    cargo_col = encontrar_coluna(
+        cabecalho,
+        ["DS_CARGO"],
+    )
+
+    if not uf_col:
+        raise RuntimeError(
+            "A coluna SG_UF não foi encontrada no arquivo do TSE."
         )
+
+    if not cargo_col:
+        raise RuntimeError(
+            "A coluna DS_CARGO não foi encontrada no arquivo do TSE."
+        )
+
+    candidatos = []
+
+    for linha in leitor:
+        uf = str(linha.get(uf_col, "")).strip().upper()
+        cargo = str(linha.get(cargo_col, "")).strip()
+
+        if uf != UF:
+            continue
 
         if cargo not in CARGOS:
             continue
@@ -120,203 +152,214 @@ def ler_candidatos(dados):
     return candidatos
 
 
-def carregar_estado():
-    if not ESTADO.exists():
-        return {}
+def preparar_registro(candidato):
+    campos_importantes = [
+        "SQ_CANDIDATO",
+        "NR_CANDIDATO",
+        "NM_CANDIDATO",
+        "NM_URNA_CANDIDATO",
+        "DS_CARGO",
+        "SG_PARTIDO",
+        "NM_PARTIDO",
+        "DS_SITUACAO_CANDIDATURA",
+        "DS_DETALHE_SITUACAO_CAND",
+    ]
 
-    try:
-        return json.loads(
-            ESTADO.read_text(
-                encoding="utf-8"
-            )
+    registro = {}
+
+    for campo in campos_importantes:
+        valor = candidato.get(campo)
+
+        if valor is not None:
+            registro[campo] = str(valor).strip()
+
+    if not registro:
+        registro = {
+            str(k): str(v)
+            for k, v in candidato.items()
+        }
+
+    return registro
+
+
+def gerar_hash(candidatos):
+    registros = [
+        preparar_registro(c)
+        for c in candidatos
+    ]
+
+    registros.sort(
+        key=lambda x: (
+            x.get("SQ_CANDIDATO", ""),
+            x.get("NM_CANDIDATO", ""),
         )
-    except Exception:
-        return {}
-
-
-def salvar_estado(estado):
-    ESTADO.write_text(
-        json.dumps(
-            estado,
-            ensure_ascii=False,
-            indent=2
-        ),
-        encoding="utf-8",
     )
 
-
-def assinatura(candidato):
     texto = json.dumps(
-        candidato,
+        registros,
         ensure_ascii=False,
         sort_keys=True,
     )
 
     return hashlib.sha256(
         texto.encode("utf-8")
-    ).hexdigest()
+    ).hexdigest(), registros
+
+
+def carregar_estado():
+    if not os.path.exists(STATE_FILE):
+        return None
+
+    with open(
+        STATE_FILE,
+        "r",
+        encoding="utf-8",
+    ) as arquivo:
+        return json.load(arquivo)
+
+
+def salvar_estado(hash_atual, registros):
+    estado = {
+        "hash": hash_atual,
+        "total": len(registros),
+        "candidatos": registros,
+    }
+
+    with open(
+        STATE_FILE,
+        "w",
+        encoding="utf-8",
+    ) as arquivo:
+        json.dump(
+            estado,
+            arquivo,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+def resumo(registros):
+    contagem = {}
+
+    for candidato in registros:
+        cargo = candidato.get(
+            "DS_CARGO",
+            "Cargo não informado",
+        )
+
+        contagem[cargo] = contagem.get(cargo, 0) + 1
+
+    linhas = []
+
+    for cargo in sorted(contagem):
+        linhas.append(
+            f"{cargo}: {contagem[cargo]}"
+        )
+
+    return "\n".join(linhas)
 
 
 def monitorar():
-
-    print("")
-    print("==============================")
+    print("=" * 50)
     print("MONITORAMENTO ELEITORAL RJ 2026")
-    print("==============================")
+    print("=" * 50)
+
+    print(f"UF: {UF}")
     print("Fonte: TSE - Candidatos 2026")
-    print("UF: RJ")
-    print("")
 
-    dados = baixar_candidatos()
+    conteudo = baixar_candidatos()
 
-    candidatos = ler_candidatos(dados)
+    candidatos = ler_candidatos(conteudo)
 
     print(
-        f"Total de candidatos encontrados: "
-        f"{len(candidatos)}"
+        f"Candidatos RJ nos cargos monitorados: {len(candidatos)}"
     )
+
+    hash_atual, registros = gerar_hash(candidatos)
 
     estado_anterior = carregar_estado()
-    estado_novo = {}
 
-    novas = []
-    alteracoes = []
-
-    for candidato in candidatos:
-
-        id_candidato = (
-            candidato.get("SQ_CANDIDATO")
-            or candidato.get("NR_CANDIDATO")
-            or candidato.get("NM_CANDIDATO")
-        )
-
-        chave = (
-            f"{candidato.get('DS_CARGO','')}|"
-            f"{id_candidato}"
-        )
-
-        atual = assinatura(candidato)
-
-        estado_novo[chave] = atual
-
-        if chave not in estado_anterior:
-
-            novas.append(candidato)
-
-        elif estado_anterior[chave] != atual:
-
-            alteracoes.append(candidato)
-
-    print(
-        f"Novas candidaturas: {len(novas)}"
-    )
-
-    print(
-        f"Alterações: {len(alteracoes)}"
-    )
-
-    for candidato in novas:
-
-        cargo = candidato.get(
-            "DS_CARGO",
-            ""
-        )
-
-        nome = candidato.get(
-            "NM_CANDIDATO",
-            ""
-        )
-
-        urna = candidato.get(
-            "NM_URNA_CANDIDATO",
-            ""
-        )
-
-        numero = candidato.get(
-            "NR_CANDIDATO",
-            ""
-        )
-
-        partido = candidato.get(
-            "SG_PARTIDO",
-            ""
-        )
-
-        situacao = candidato.get(
-            "DS_SITUACAO_CANDIDATURA",
-            ""
-        )
+    if estado_anterior is None:
+        salvar_estado(hash_atual, registros)
 
         mensagem = (
-            "🗳️ NOVA CANDIDATURA — RJ 2026\n\n"
-            f"Cargo: {cargo}\n"
-            f"Candidato: {nome}\n"
-            f"Nome de urna: {urna}\n"
-            f"Número: {numero}\n"
-            f"Partido: {partido}\n"
-            f"Situação: {situacao}"
-        )
-
-        print(
-            f"Enviando nova candidatura: {nome}"
+            "🟢 MONITORAMENTO ELEITORAL RJ 2026\n\n"
+            "Monitoramento iniciado com sucesso.\n\n"
+            f"Candidatos monitorados: {len(registros)}\n\n"
+            f"{resumo(registros)}\n\n"
+            "Fonte: TSE - Candidatos 2026."
         )
 
         telegram(mensagem)
 
-    for candidato in alteracoes:
+        print("Primeira execução concluída.")
+        return
 
-        cargo = candidato.get(
-            "DS_CARGO",
-            ""
-        )
+    if estado_anterior.get("hash") == hash_atual:
+        print("Nenhuma alteração detectada.")
+        return
 
-        nome = candidato.get(
-            "NM_CANDIDATO",
-            ""
-        )
+    anterior = estado_anterior.get(
+        "candidatos",
+        [],
+    )
 
-        urna = candidato.get(
-            "NM_URNA_CANDIDATO",
-            ""
-        )
+    antigos = {
+        x.get("SQ_CANDIDATO", ""): x
+        for x in anterior
+    }
 
-        numero = candidato.get(
-            "NR_CANDIDATO",
-            ""
-        )
+    atuais = {
+        x.get("SQ_CANDIDATO", ""): x
+        for x in registros
+    }
 
-        partido = candidato.get(
-            "SG_PARTIDO",
-            ""
-        )
+    adicionados = [
+        atuais[k]
+        for k in atuais
+        if k not in antigos
+    ]
 
-        situacao = candidato.get(
-            "DS_SITUACAO_CANDIDATURA",
-            ""
-        )
+    removidos = [
+        antigos[k]
+        for k in antigos
+        if k not in atuais
+    ]
 
-        mensagem = (
-            "⚠️ ALTERAÇÃO EM CANDIDATURA — RJ 2026\n\n"
-            f"Cargo: {cargo}\n"
-            f"Candidato: {nome}\n"
-            f"Nome de urna: {urna}\n"
-            f"Número: {numero}\n"
-            f"Partido: {partido}\n"
-            f"Situação: {situacao}"
-        )
+    mensagem = (
+        "🚨 ALTERAÇÃO NO MONITORAMENTO ELEITORAL RJ 2026\n\n"
+        f"Candidatos atuais: {len(registros)}\n\n"
+    )
 
-        print(
-            f"Enviando alteração: {nome}"
-        )
+    if adicionados:
+        mensagem += "🟢 NOVOS CANDIDATOS:\n"
 
-        telegram(mensagem)
+        for candidato in adicionados[:30]:
+            mensagem += (
+                f"- {candidato.get('NM_CANDIDATO', 'Nome não informado')} "
+                f"({candidato.get('DS_CARGO', '')})\n"
+            )
 
-    salvar_estado(estado_novo)
+        mensagem += "\n"
 
-    print("")
-    print("==============================")
-    print("MONITORAMENTO CONCLUÍDO")
-    print("==============================")
+    if removidos:
+        mensagem += "🔴 CANDIDATOS REMOVIDOS:\n"
+
+        for candidato in removidos[:30]:
+            mensagem += (
+                f"- {candidato.get('NM_CANDIDATO', 'Nome não informado')} "
+                f"({candidato.get('DS_CARGO', '')})\n"
+            )
+
+        mensagem += "\n"
+
+    mensagem += "Fonte: TSE - Candidatos 2026."
+
+    telegram(mensagem)
+
+    salvar_estado(hash_atual, registros)
+
+    print("Alteração detectada e enviada pelo Telegram.")
 
 
 if __name__ == "__main__":
